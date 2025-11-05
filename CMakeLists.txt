@@ -19,8 +19,7 @@ set(PLUGIN_API_DIR ${CMAKE_SOURCE_DIR}/PluginAPI)
 add_library(UnityPlugin SHARED
         src/Plugin.h
         src/Plugin.cpp
-        src/BindlessManager.hpp
-        src/BindlessManager.cpp
+        src/HookWrapper.hpp
 )
 
 target_include_directories(UnityPlugin
