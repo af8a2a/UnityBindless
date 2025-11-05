@@ -16,13 +16,13 @@ endif ()
 set(PLUGIN_API_DIR ${CMAKE_SOURCE_DIR}/PluginAPI)
 
 
-add_library(UnityPlugin SHARED
+add_library(UnityBindless SHARED
         src/Plugin.h
         src/Plugin.cpp
         src/HookWrapper.hpp
 )
 
-target_include_directories(UnityPlugin
+target_include_directories(UnityBindless
         PRIVATE
         ${PLUGIN_API_DIR}
 )
@@ -31,8 +31,8 @@ target_include_directories(UnityPlugin
 
 
 if (WIN32)
-    set_target_properties(UnityPlugin PROPERTIES
-            OUTPUT_NAME "UnityPlugin"
+    set_target_properties(UnityBindless PROPERTIES
+            OUTPUT_NAME "UnityBindless"
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
             LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
             ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
@@ -49,7 +49,7 @@ endforeach()
 
 
 # Link prebuilt NRD & NRI
-target_link_libraries(UnityPlugin PRIVATE
+target_link_libraries(UnityBindless PRIVATE
         $<IF:$<CONFIG:Debug>,${NRD_LIB_DEBUG},${NRD_LIB_RELEASE}>
         $<IF:$<CONFIG:Debug>,${NRI_LIB_DEBUG},${NRI_LIB_RELEASE}>
         minhook

@@ -235,6 +235,50 @@ UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateSRVDescriptor(ID3D12Resour
 }
 
 
+UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateUAVDescriptor(ID3D12Resource *pTexture, uint32_t index) {
+    if (s_pDescriptorHeap_CBV_SRV_UAV == nullptr) {
+        UNITY_LOG_ERROR(g_Log, "Failed to get descriptor heap");
+        return false;
+    }
+
+    const IUnityGraphicsD3D12v8 *pD3d12 = g_unityInterfaces->Get<IUnityGraphicsD3D12v8>();
+    ID3D12Device *pDevice = pD3d12->GetDevice();
+    if (pDevice == nullptr) {
+        UNITY_LOG_ERROR(g_Log, "Failed to get D3D12 device");
+        return false;
+    }
+
+    const SIZE_T ptrOffset = static_cast<SIZE_T>(index) * s_descriptorHeap_CBV_SRV_UAV_IncrementSize;
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptorHandle =
+    {
+        s_descriptorHeap_CBV_SRV_UAV_CPUDescriptorHandleForHeapStart + ptrOffset
+    };
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = pTexture->GetDesc().Format;
+    switch (uavDesc.Format) {
+        // Override TYPELESS resources to prevent device removed.
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_R32_TYPELESS: uavDesc.Format = DXGI_FORMAT_R32_UINT;
+            break;
+        case DXGI_FORMAT_R16_TYPELESS: uavDesc.Format = DXGI_FORMAT_R16_UINT;
+            break;
+        case DXGI_FORMAT_D16_UNORM: uavDesc.Format = DXGI_FORMAT_R16_UINT;
+            break;
+        default:
+            break;
+    }
+
+
+    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uavDesc.Texture2D.MipSlice = UINT_MAX;
+    uavDesc.Texture2D.PlaneSlice = 0;
+    //not support counter resouce yet
+    pDevice->CreateUnorderedAccessView(pTexture, NULL, &uavDesc, descriptorHandle);
+
+    return true;
+}
+
 UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CheckBindlessSupport() {
     if (g_unityGraphics_D3D12) {
         ID3D12Device *device = g_unityGraphics_D3D12->GetDevice();
