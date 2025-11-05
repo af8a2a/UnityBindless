@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
+add_subdirectory(External/minhook)
 
 project(UnityPlugin VERSION 0.1.0 LANGUAGES C CXX)
 
@@ -18,6 +19,8 @@ set(PLUGIN_API_DIR ${CMAKE_SOURCE_DIR}/PluginAPI)
 add_library(UnityPlugin SHARED
         src/Plugin.h
         src/Plugin.cpp
+        src/BindlessManager.hpp
+        src/BindlessManager.cpp
 )
 
 target_include_directories(UnityPlugin
@@ -44,9 +47,12 @@ foreach(_lib ${NRD_LIB_DEBUG} ${NRD_LIB_RELEASE} ${NRI_LIB_DEBUG} ${NRI_LIB_RELE
     endif ()
 endforeach()
 
+
+
 # Link prebuilt NRD & NRI
 target_link_libraries(UnityPlugin PRIVATE
         $<IF:$<CONFIG:Debug>,${NRD_LIB_DEBUG},${NRD_LIB_RELEASE}>
         $<IF:$<CONFIG:Debug>,${NRI_LIB_DEBUG},${NRI_LIB_RELEASE}>
+        minhook
 )
 
