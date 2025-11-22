@@ -3,6 +3,7 @@
 #pragma comment(lib, "d3d12")
 
 #include <atomic>
+#include <format>
 #include <d3d12.h>
 
 #include <dxgi.h>
@@ -152,7 +153,7 @@ UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API UnityPluginLoad(IUnityInterfaces
     );
     s_pSerializeRootSignatureHook->CreateAndEnable(&DetourD3D12SerializeRootSignature);
 
-
+    g_unityGraphics_D3D12 = g_unityInterfaces->Get<IUnityGraphicsD3D12v8>();
     // Run OnGraphicsDeviceEvent(initialize) manually on plugin load
     OnGraphicsDeviceEvent(kUnityGfxDeviceEventInitialize);
 }
@@ -279,6 +280,25 @@ UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateUAVDescriptor(ID3D12Resour
     return true;
 }
 
+
+std::string shaderModelToString(D3D_SHADER_MODEL shader_model) {
+    switch (shader_model) {
+        case D3D_SHADER_MODEL_NONE: return "Not Support";
+        case D3D_SHADER_MODEL_5_1: return "ShaderModel5_1";
+        case D3D_SHADER_MODEL_6_0: return "ShaderModel6_0";
+        case D3D_SHADER_MODEL_6_1: return "ShaderModel6_1";
+        case D3D_SHADER_MODEL_6_2: return "ShaderModel6_2";
+        case D3D_SHADER_MODEL_6_3: return "ShaderModel6_3";
+        case D3D_SHADER_MODEL_6_4: return "ShaderModel6_4";
+        case D3D_SHADER_MODEL_6_5: return "ShaderModel6_5";
+        case D3D_SHADER_MODEL_6_6: return "ShaderModel6_6";
+        case D3D_SHADER_MODEL_6_7: return "ShaderModel6_7";
+        case D3D_SHADER_MODEL_6_8: return "ShaderModel6_8";
+        case D3D_SHADER_MODEL_6_9: return "ShaderModel6_9";
+        default: return "ShaderModel6_0";
+    }
+}
+
 UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CheckBindlessSupport() {
     if (g_unityGraphics_D3D12) {
         ID3D12Device *device = g_unityGraphics_D3D12->GetDevice();
@@ -288,10 +308,19 @@ UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CheckBindlessSupport() {
             &shaderModel, sizeof(shaderModel));
 
         if (SUCCEEDED(hr) && shaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_6) {
+            auto result = std::format("Current GPU's Highest Shader model is {}", shaderModelToString(shaderModel.HighestShaderModel));
+            UNITY_LOG(g_Log, "Current GPU's Support ShaderModel6_6");
             return true;
+        } else {
+            auto result = std::format("Current GPU's Highest Shader model is {}", shaderModelToString(shaderModel.HighestShaderModel));
+            UNITY_LOG_ERROR(g_Log, result.c_str());
+            return false;
         }
     }
-    UNITY_LOG_ERROR(g_Log, "Current GPU not support SM6.6");
+
+
+    UNITY_LOG_ERROR(g_Log, "D3D12 device Not ready");
+
 
     return false;
 }
