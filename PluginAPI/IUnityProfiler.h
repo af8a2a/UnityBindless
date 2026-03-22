@@ -94,6 +94,8 @@ enum UnityBuiltinProfilerCategory_
     kUnityProfilerCategoryDebug = 36,
     kUnityProfilerCategoryJobs = 37,
     kUnityProfilerCategoryText = 38,
+    kUnityProfilerCategoryU2D = 39,
+    kUnityProfilerCategoryUIToolkit = 40,
 };
 typedef uint16_t UnityProfilerCategoryId;
 
