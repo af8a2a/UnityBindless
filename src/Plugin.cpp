@@ -7,6 +7,7 @@
 #include <array>
 #include <format>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -51,12 +52,21 @@ static constexpr UINT kAbsoluteMaxDescriptorCount = 1000000u;
 static constexpr size_t kCreateDescriptorHeapVTableIndex = 14u;
 static constexpr size_t kSetDescriptorHeapsVTableIndex = 28u;
 static constexpr size_t kMaxCreateDescriptorHeapHookSlots = 16u;
+static constexpr size_t kMaxCreateDescriptorHeapVTablePatchSlots = 32u;
 static constexpr size_t kMaxSetDescriptorHeapsHookSlots = 64u;
 
 struct CreateDescriptorHeapHookState {
     HookWrapper<t_CreateDescriptorHeap> *hook = nullptr;
+    t_CreateDescriptorHeap original = nullptr;
     const char *interfaceName = nullptr;
     void *target = nullptr;
+};
+
+struct CreateDescriptorHeapVTablePatchState {
+    const char *interfaceName = nullptr;
+    void **entry = nullptr;
+    void *originalTarget = nullptr;
+    size_t hookIndex = SIZE_MAX;
 };
 
 struct SetDescriptorHeapsHookState {
@@ -70,6 +80,11 @@ struct DescriptorHeapMetadata {
     UINT bindlessDescriptorStart = 0;
     UINT bindlessDescriptorCount = 0;
     bool pluginOwnedRange = false;
+};
+
+struct DescriptorHeapMetadataLookupResult {
+    DescriptorHeapMetadata metadata = {};
+    const char *source = "default";
 };
 
 struct DescriptorHeapSelectionState {
@@ -86,12 +101,16 @@ struct DescriptorHeapSelectionState {
 static HookWrapper<t_D3D12SerializeRootSignature> *s_pSerializeRootSignatureHook = nullptr;
 static std::array<CreateDescriptorHeapHookState, kMaxCreateDescriptorHeapHookSlots> s_createDescriptorHeapHooks = {};
 static size_t s_createDescriptorHeapHookCount = 0;
+static std::array<CreateDescriptorHeapVTablePatchState, kMaxCreateDescriptorHeapVTablePatchSlots> s_createDescriptorHeapVTablePatches = {};
+static size_t s_createDescriptorHeapVTablePatchCount = 0;
 static std::array<SetDescriptorHeapsHookState, kMaxSetDescriptorHeapsHookSlots> s_setDescriptorHeapsHooks = {};
 static size_t s_setDescriptorHeapsHookCount = 0;
 static std::string s_createDescriptorHeapHookReport = "not attempted";
 static std::string s_setDescriptorHeapsHookReport = "not attempted";
 static std::unordered_map<ID3D12DescriptorHeap *, DescriptorHeapMetadata> s_descriptorHeapMetadata = {};
+static std::unordered_map<SIZE_T, DescriptorHeapMetadata> s_descriptorHeapMetadataByCpuStart = {};
 static DescriptorHeapSelectionState s_descriptorHeapSelection = {};
+static DescriptorHeapSelectionState s_pluginOwnedDescriptorHeapSelection = {};
 static std::string s_lastDescriptorHeapUnavailableMessage;
 static uint64_t s_setDescriptorHeapsObservedCount = 0;
 
@@ -195,6 +214,29 @@ static std::string AddressWithModuleToString(const void *address) {
     return std::format("{} [{}]", PointerToString(address), ModuleForAddressToString(address));
 }
 
+static bool PatchPointerWithWritableProtection(void **entry, void *value) {
+    if (entry == nullptr) {
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION memoryInfo = {};
+    if (VirtualQuery(entry, &memoryInfo, sizeof(memoryInfo)) == 0) {
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(memoryInfo.BaseAddress, memoryInfo.RegionSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        return false;
+    }
+
+    *entry = value;
+    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(void *));
+
+    DWORD restoredProtect = 0;
+    const BOOL restored = VirtualProtect(memoryInfo.BaseAddress, memoryInfo.RegionSize, oldProtect, &restoredProtect);
+    return restored != FALSE;
+}
+
 static void AppendDiagnosticInfo(std::string &report, const std::string &message) {
     if (!report.empty()) {
         report += "; ";
@@ -249,6 +291,28 @@ static std::string BuildSetDescriptorHeapsHookInfo() {
     return result.empty() ? "none" : result;
 }
 
+static size_t FindCreateDescriptorHeapHookIndexByTarget(const void *target) {
+    for (size_t i = 0; i < s_createDescriptorHeapHookCount; ++i) {
+        const CreateDescriptorHeapHookState &hookState = s_createDescriptorHeapHooks[i];
+        if (hookState.target == target) {
+            return i;
+        }
+    }
+
+    return SIZE_MAX;
+}
+
+static size_t FindCreateDescriptorHeapVTablePatchIndexByEntry(void **entry) {
+    for (size_t i = 0; i < s_createDescriptorHeapVTablePatchCount; ++i) {
+        const CreateDescriptorHeapVTablePatchState &patchState = s_createDescriptorHeapVTablePatches[i];
+        if (patchState.entry == entry) {
+            return i;
+        }
+    }
+
+    return SIZE_MAX;
+}
+
 static std::string HeapDescToString(const D3D12_DESCRIPTOR_HEAP_DESC &desc) {
     return std::format(
         "type={}, flags={}, shaderVisible={}, numDescriptors={}, nodeMask={}",
@@ -270,10 +334,55 @@ static std::string DescriptorHeapMetadataToString(const DescriptorHeapMetadata &
     );
 }
 
+static SIZE_T GetDescriptorHeapCpuStart(ID3D12DescriptorHeap *pHeap) {
+    if (pHeap == nullptr) {
+        return 0;
+    }
+
+    return pHeap->GetCPUDescriptorHandleForHeapStart().ptr;
+}
+
+static void NormalizeDescriptorHeapMetadata(
+    const D3D12_DESCRIPTOR_HEAP_DESC &desc,
+    DescriptorHeapMetadata &metadata
+) {
+    metadata.totalDescriptorCount = desc.NumDescriptors;
+    if (metadata.bindlessDescriptorStart > metadata.totalDescriptorCount) {
+        metadata.bindlessDescriptorStart = metadata.totalDescriptorCount;
+    }
+
+    const uint64_t bindlessRangeEnd = static_cast<uint64_t>(metadata.bindlessDescriptorStart)
+        + static_cast<uint64_t>(metadata.bindlessDescriptorCount);
+    if (bindlessRangeEnd > metadata.totalDescriptorCount) {
+        metadata.bindlessDescriptorCount = metadata.totalDescriptorCount - metadata.bindlessDescriptorStart;
+    }
+
+    metadata.pluginOwnedRange = metadata.bindlessDescriptorCount > 0;
+}
+
+static void StoreDescriptorHeapMetadata(
+    ID3D12DescriptorHeap *pHeap,
+    const DescriptorHeapMetadata &metadata
+) {
+    if (pHeap == nullptr) {
+        return;
+    }
+
+    s_descriptorHeapMetadata[pHeap] = metadata;
+
+    const SIZE_T cpuStart = GetDescriptorHeapCpuStart(pHeap);
+    if (cpuStart != 0) {
+        s_descriptorHeapMetadataByCpuStart[cpuStart] = metadata;
+    }
+}
+
 static void ResetDescriptorHeapTrackingState() {
     s_descriptorHeapMetadata.clear();
+    s_descriptorHeapMetadataByCpuStart.clear();
     s_descriptorHeapSelection = {};
     s_descriptorHeapSelection.captureSource = "none";
+    s_pluginOwnedDescriptorHeapSelection = {};
+    s_pluginOwnedDescriptorHeapSelection.captureSource = "none";
     s_lastDescriptorHeapUnavailableMessage.clear();
     s_setDescriptorHeapsObservedCount = 0;
 }
@@ -288,34 +397,127 @@ static bool IsShaderVisibleCBVSRVUAVHeap(ID3D12DescriptorHeap *pHeap) {
         && (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
 }
 
-static DescriptorHeapMetadata GetDescriptorHeapMetadata(ID3D12DescriptorHeap *pHeap) {
+static DescriptorHeapMetadataLookupResult LookupDescriptorHeapMetadata(ID3D12DescriptorHeap *pHeap) {
     const D3D12_DESCRIPTOR_HEAP_DESC desc = pHeap->GetDesc();
 
-    DescriptorHeapMetadata metadata = {};
-    metadata.totalDescriptorCount = desc.NumDescriptors;
-    metadata.bindlessDescriptorStart = desc.NumDescriptors;
-    metadata.bindlessDescriptorCount = 0;
-    metadata.pluginOwnedRange = false;
+    DescriptorHeapMetadataLookupResult result = {};
+    result.metadata.totalDescriptorCount = desc.NumDescriptors;
+    result.metadata.bindlessDescriptorStart = desc.NumDescriptors;
+    result.metadata.bindlessDescriptorCount = 0;
+    result.metadata.pluginOwnedRange = false;
 
     const auto iterator = s_descriptorHeapMetadata.find(pHeap);
     if (iterator != s_descriptorHeapMetadata.end()) {
-        metadata = iterator->second;
-        metadata.totalDescriptorCount = desc.NumDescriptors;
-        if (metadata.bindlessDescriptorStart > metadata.totalDescriptorCount) {
-            metadata.bindlessDescriptorStart = metadata.totalDescriptorCount;
+        result.metadata = iterator->second;
+        result.source = "pointer";
+    } else {
+        const SIZE_T cpuStart = GetDescriptorHeapCpuStart(pHeap);
+        if (cpuStart != 0) {
+            const auto cpuStartIterator = s_descriptorHeapMetadataByCpuStart.find(cpuStart);
+            if (cpuStartIterator != s_descriptorHeapMetadataByCpuStart.end()) {
+                result.metadata = cpuStartIterator->second;
+                result.source = "cpuStart";
+                LogInfo(std::format(
+                    "Recovered descriptor heap metadata by CPU start: heap={}, cpuStart=0x{:X}, {}",
+                    PointerToString(pHeap),
+                    static_cast<unsigned long long>(cpuStart),
+                    DescriptorHeapMetadataToString(result.metadata)
+                ));
+            }
         }
 
-        const uint64_t bindlessRangeEnd = static_cast<uint64_t>(metadata.bindlessDescriptorStart)
-            + static_cast<uint64_t>(metadata.bindlessDescriptorCount);
-        if (bindlessRangeEnd > metadata.totalDescriptorCount) {
-            metadata.bindlessDescriptorCount = metadata.totalDescriptorCount - metadata.bindlessDescriptorStart;
+        if (std::string_view(result.source) == "default"
+            && desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+            && (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0
+            && desc.NumDescriptors >= kMainDescriptorHeapMinCount) {
+            LogError(std::format(
+                "Descriptor heap metadata lookup missed for a large shader-visible CBV/SRV/UAV heap: heap={}, cpuStart=0x{:X}, {}. CreateDescriptorHeap may not have been detoured for this heap.",
+                PointerToString(pHeap),
+                static_cast<unsigned long long>(cpuStart),
+                HeapDescToString(desc)
+            ));
         }
-
-        metadata.pluginOwnedRange = metadata.bindlessDescriptorCount > 0;
     }
 
-    s_descriptorHeapMetadata[pHeap] = metadata;
-    return metadata;
+    NormalizeDescriptorHeapMetadata(desc, result.metadata);
+    StoreDescriptorHeapMetadata(pHeap, result.metadata);
+    return result;
+}
+
+static bool HasPluginOwnedBindlessRange(const DescriptorHeapSelectionState &selection) {
+    return selection.heap != nullptr
+        && selection.pluginOwnedRange
+        && selection.bindlessDescriptorCount > 0;
+}
+
+static const DescriptorHeapSelectionState *GetDescriptorHeapSelectionForQueries() {
+    if (s_descriptorHeapSelection.heap != nullptr) {
+        return &s_descriptorHeapSelection;
+    }
+
+    if (s_pluginOwnedDescriptorHeapSelection.heap != nullptr) {
+        return &s_pluginOwnedDescriptorHeapSelection;
+    }
+
+    return nullptr;
+}
+
+static const DescriptorHeapSelectionState *GetBindlessDescriptorHeapSelection() {
+    if (HasPluginOwnedBindlessRange(s_descriptorHeapSelection)) {
+        return &s_descriptorHeapSelection;
+    }
+
+    if (HasPluginOwnedBindlessRange(s_pluginOwnedDescriptorHeapSelection)) {
+        return &s_pluginOwnedDescriptorHeapSelection;
+    }
+
+    return nullptr;
+}
+
+static void CachePluginOwnedDescriptorHeap(
+    ID3D12Device *pDevice,
+    ID3D12DescriptorHeap *pHeap,
+    const DescriptorHeapMetadata &metadata,
+    const std::string &captureSource
+) {
+    if (pHeap == nullptr || !metadata.pluginOwnedRange) {
+        return;
+    }
+
+    const UINT incrementSize =
+        pDevice != nullptr ? pDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) : 0;
+    const SIZE_T cpuDescriptorHandleForHeapStart = GetDescriptorHeapCpuStart(pHeap);
+    const bool selectionChanged =
+        s_pluginOwnedDescriptorHeapSelection.heap != pHeap
+        || s_pluginOwnedDescriptorHeapSelection.incrementSize != incrementSize
+        || s_pluginOwnedDescriptorHeapSelection.cpuDescriptorHandleForHeapStart != cpuDescriptorHandleForHeapStart
+        || s_pluginOwnedDescriptorHeapSelection.totalDescriptorCount != metadata.totalDescriptorCount
+        || s_pluginOwnedDescriptorHeapSelection.bindlessDescriptorStart != metadata.bindlessDescriptorStart
+        || s_pluginOwnedDescriptorHeapSelection.bindlessDescriptorCount != metadata.bindlessDescriptorCount
+        || s_pluginOwnedDescriptorHeapSelection.pluginOwnedRange != metadata.pluginOwnedRange
+        || s_pluginOwnedDescriptorHeapSelection.captureSource != captureSource;
+
+    s_pluginOwnedDescriptorHeapSelection.heap = pHeap;
+    s_pluginOwnedDescriptorHeapSelection.incrementSize = incrementSize;
+    s_pluginOwnedDescriptorHeapSelection.cpuDescriptorHandleForHeapStart = cpuDescriptorHandleForHeapStart;
+    s_pluginOwnedDescriptorHeapSelection.totalDescriptorCount = metadata.totalDescriptorCount;
+    s_pluginOwnedDescriptorHeapSelection.bindlessDescriptorStart = metadata.bindlessDescriptorStart;
+    s_pluginOwnedDescriptorHeapSelection.bindlessDescriptorCount = metadata.bindlessDescriptorCount;
+    s_pluginOwnedDescriptorHeapSelection.pluginOwnedRange = metadata.pluginOwnedRange;
+    s_pluginOwnedDescriptorHeapSelection.captureSource = captureSource;
+
+    if (selectionChanged) {
+        const D3D12_DESCRIPTOR_HEAP_DESC capturedDesc = pHeap->GetDesc();
+        LogInfo(std::format(
+            "Cached plugin-owned bindless heap from {}: heap={}, {}, {}, incrementSize={}, cpuStart=0x{:X}",
+            captureSource,
+            PointerToString(pHeap),
+            HeapDescToString(capturedDesc),
+            DescriptorHeapMetadataToString(metadata),
+            incrementSize,
+            static_cast<unsigned long long>(cpuDescriptorHandleForHeapStart)
+        ));
+    }
 }
 
 static bool ShouldReplaceSelectedDescriptorHeap(
@@ -361,15 +563,17 @@ static void CacheDescriptorHeap(
         return;
     }
 
-    const DescriptorHeapMetadata metadata = GetDescriptorHeapMetadata(pHeap);
+    const DescriptorHeapMetadataLookupResult metadataLookup = LookupDescriptorHeapMetadata(pHeap);
+    const DescriptorHeapMetadata &metadata = metadataLookup.metadata;
     const std::string captureSource = source != nullptr ? source : "unknown";
+    CachePluginOwnedDescriptorHeap(pDevice, pHeap, metadata, captureSource);
     if (!ShouldReplaceSelectedDescriptorHeap(pHeap, metadata, captureSource)) {
         return;
     }
 
     const UINT incrementSize =
         pDevice != nullptr ? pDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) : 0;
-    const SIZE_T cpuDescriptorHandleForHeapStart = pHeap->GetCPUDescriptorHandleForHeapStart().ptr;
+    const SIZE_T cpuDescriptorHandleForHeapStart = GetDescriptorHeapCpuStart(pHeap);
     const bool selectionChanged =
         s_descriptorHeapSelection.heap != pHeap
         || s_descriptorHeapSelection.incrementSize != incrementSize
@@ -393,41 +597,45 @@ static void CacheDescriptorHeap(
     if (selectionChanged) {
         const D3D12_DESCRIPTOR_HEAP_DESC capturedDesc = pHeap->GetDesc();
         LogInfo(std::format(
-            "Selected shader-visible CBV/SRV/UAV heap from {}: heap={}, {}, {}, incrementSize={}, cpuStart=0x{:X}",
+            "Selected shader-visible CBV/SRV/UAV heap from {}: heap={}, {}, {}, incrementSize={}, cpuStart=0x{:X}, metadataSource={}",
             s_descriptorHeapSelection.captureSource,
             PointerToString(s_descriptorHeapSelection.heap),
             HeapDescToString(capturedDesc),
             DescriptorHeapMetadataToString(metadata),
             s_descriptorHeapSelection.incrementSize,
-            static_cast<unsigned long long>(s_descriptorHeapSelection.cpuDescriptorHandleForHeapStart)
+            static_cast<unsigned long long>(s_descriptorHeapSelection.cpuDescriptorHandleForHeapStart),
+            metadataLookup.source
         ));
     }
 }
 
 static bool HasPluginOwnedBindlessRange() {
-    return s_descriptorHeapSelection.heap != nullptr
-        && s_descriptorHeapSelection.pluginOwnedRange
-        && s_descriptorHeapSelection.bindlessDescriptorCount > 0;
+    return GetBindlessDescriptorHeapSelection() != nullptr;
 }
 
 static bool IsBindlessDescriptorIndexInRange(const uint32_t index) {
-    if (!HasPluginOwnedBindlessRange()) {
+    const DescriptorHeapSelectionState *selection = GetBindlessDescriptorHeapSelection();
+    if (selection == nullptr) {
         return false;
     }
 
-    const uint64_t bindlessStart = s_descriptorHeapSelection.bindlessDescriptorStart;
-    const uint64_t bindlessEnd = bindlessStart + s_descriptorHeapSelection.bindlessDescriptorCount;
+    const uint64_t bindlessStart = selection->bindlessDescriptorStart;
+    const uint64_t bindlessEnd = bindlessStart + selection->bindlessDescriptorCount;
     return index >= bindlessStart && index < bindlessEnd;
 }
 
 static void LogDescriptorHeapUnavailable(const char *context) {
     const ID3D12Device *pDevice = g_unityGraphics_D3D12 != nullptr ? g_unityGraphics_D3D12->GetDevice() : nullptr;
+    const DescriptorHeapSelectionState *activeSelection = GetDescriptorHeapSelectionForQueries();
+    const DescriptorHeapSelectionState *bindlessSelection = GetBindlessDescriptorHeapSelection();
     const std::string message = std::format(
-        "{}: renderer={}, unityD3D12={}, device={}, cachedHeap={}, totalCount={}, bindlessStart={}, bindlessCount={}, pluginOwnedRange={}, incrementSize={}, cpuStart=0x{:X}, captureSource={}, createDescriptorHeapHooks={}, createDescriptorHeapReport={}, setDescriptorHeapsHooks={}, setDescriptorHeapsReport={}, setDescriptorHeapsObserved={}",
+        "{}: renderer={}, unityD3D12={}, device={}, activeHeap={}, activeBindlessHeap={}, cachedHeap={}, totalCount={}, bindlessStart={}, bindlessCount={}, pluginOwnedRange={}, incrementSize={}, cpuStart=0x{:X}, captureSource={}, pluginOwnedHeap={}, pluginOwnedTotalCount={}, pluginOwnedBindlessStart={}, pluginOwnedBindlessCount={}, pluginOwnedIncrementSize={}, pluginOwnedCpuStart=0x{:X}, pluginOwnedCaptureSource={}, createDescriptorHeapHooks={}, createDescriptorHeapReport={}, setDescriptorHeapsHooks={}, setDescriptorHeapsReport={}, setDescriptorHeapsObserved={}",
         context != nullptr ? context : "Descriptor heap unavailable",
         RendererToString(g_unityGraphics != nullptr ? g_unityGraphics->GetRenderer() : kUnityGfxRendererNull),
         PointerToString(g_unityGraphics_D3D12),
         PointerToString(pDevice),
+        PointerToString(activeSelection != nullptr ? activeSelection->heap : nullptr),
+        PointerToString(bindlessSelection != nullptr ? bindlessSelection->heap : nullptr),
         PointerToString(s_descriptorHeapSelection.heap),
         s_descriptorHeapSelection.totalDescriptorCount,
         s_descriptorHeapSelection.bindlessDescriptorStart,
@@ -436,6 +644,13 @@ static void LogDescriptorHeapUnavailable(const char *context) {
         s_descriptorHeapSelection.incrementSize,
         static_cast<unsigned long long>(s_descriptorHeapSelection.cpuDescriptorHandleForHeapStart),
         s_descriptorHeapSelection.captureSource,
+        PointerToString(s_pluginOwnedDescriptorHeapSelection.heap),
+        s_pluginOwnedDescriptorHeapSelection.totalDescriptorCount,
+        s_pluginOwnedDescriptorHeapSelection.bindlessDescriptorStart,
+        s_pluginOwnedDescriptorHeapSelection.bindlessDescriptorCount,
+        s_pluginOwnedDescriptorHeapSelection.incrementSize,
+        static_cast<unsigned long long>(s_pluginOwnedDescriptorHeapSelection.cpuDescriptorHandleForHeapStart),
+        s_pluginOwnedDescriptorHeapSelection.captureSource,
         BuildCreateDescriptorHeapHookInfo(),
         s_createDescriptorHeapHookReport,
         BuildSetDescriptorHeapsHookInfo(),
@@ -581,9 +796,9 @@ static HRESULT DetourCreateDescriptorHeapImpl(
     }
 
     const CreateDescriptorHeapHookState &hookState = s_createDescriptorHeapHooks[hookIndex];
-    if (hookState.hook == nullptr) {
+    if (hookState.original == nullptr) {
         LogError(std::format(
-            "DetourCreateDescriptorHeap invoked with missing hook state at slot {}.",
+            "DetourCreateDescriptorHeap invoked with missing original function at slot {}.",
             hookIndex
         ));
         return E_FAIL;
@@ -607,7 +822,7 @@ static HRESULT DetourCreateDescriptorHeapImpl(
         }
     }
 
-    const HRESULT result = hookState.hook->GetOriginalPtr()(pThis, descriptorHeapDescForCreate, riid, ppvHeap);
+    const HRESULT result = hookState.original(pThis, descriptorHeapDescForCreate, riid, ppvHeap);
     if (FAILED(result)) {
         LogError(std::format(
             "CreateDescriptorHeap failed: slot={}, interface={}, target={}, hr=0x{:08X}",
@@ -636,21 +851,10 @@ static HRESULT DetourCreateDescriptorHeapImpl(
         metadata.bindlessDescriptorCount = 0;
         metadata.pluginOwnedRange = false;
     } else {
-        metadata.totalDescriptorCount = actualDescriptorHeapDesc.NumDescriptors;
-        if (metadata.bindlessDescriptorStart > metadata.totalDescriptorCount) {
-            metadata.bindlessDescriptorStart = metadata.totalDescriptorCount;
-        }
-
-        const uint64_t bindlessRangeEnd = static_cast<uint64_t>(metadata.bindlessDescriptorStart)
-            + static_cast<uint64_t>(metadata.bindlessDescriptorCount);
-        if (bindlessRangeEnd > metadata.totalDescriptorCount) {
-            metadata.bindlessDescriptorCount = metadata.totalDescriptorCount - metadata.bindlessDescriptorStart;
-        }
-
-        metadata.pluginOwnedRange = metadata.bindlessDescriptorCount > 0;
+        NormalizeDescriptorHeapMetadata(actualDescriptorHeapDesc, metadata);
     }
 
-    s_descriptorHeapMetadata[pHeap] = metadata;
+    StoreDescriptorHeapMetadata(pHeap, metadata);
     CacheDescriptorHeap(pThis, pHeap, "CreateDescriptorHeap");
     return result;
 }
@@ -703,10 +907,107 @@ static const std::array<t_CreateDescriptorHeap, kMaxCreateDescriptorHeapHookSlot
     &DetourCreateDescriptorHeap15
 };
 
+static bool InstallCreateDescriptorHeapVTablePatch(
+    const char *interfaceName,
+    void **entry,
+    void *originalTarget,
+    size_t hookIndex,
+    std::string &diagnosticReport
+) {
+    if (entry == nullptr || originalTarget == nullptr || hookIndex >= s_createDescriptorHeapHookCount) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format(
+                "{}=invalid-vtable-patch(entry={}, target={}, hookIndex={})",
+                interfaceName != nullptr ? interfaceName : "unknown",
+                PointerToString(entry),
+                PointerToString(originalTarget),
+                hookIndex
+            )
+        );
+        return false;
+    }
+
+    const size_t existingPatchIndex = FindCreateDescriptorHeapVTablePatchIndexByEntry(entry);
+    if (existingPatchIndex != SIZE_MAX) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format(
+                "{}=vtable-duplicate(entry={}, hookSlot={})",
+                interfaceName != nullptr ? interfaceName : "unknown",
+                PointerToString(entry),
+                s_createDescriptorHeapVTablePatches[existingPatchIndex].hookIndex
+            )
+        );
+        return true;
+    }
+
+    if (s_createDescriptorHeapVTablePatchCount >= s_createDescriptorHeapVTablePatches.size()) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=vtable-capacity-exceeded", interfaceName != nullptr ? interfaceName : "unknown")
+        );
+        return false;
+    }
+
+    if (*entry != reinterpret_cast<void *>(kCreateDescriptorHeapDetours[hookIndex])) {
+        if (!PatchPointerWithWritableProtection(entry, reinterpret_cast<void *>(kCreateDescriptorHeapDetours[hookIndex]))) {
+            AppendDiagnosticInfo(
+                diagnosticReport,
+                std::format(
+                    "{}=vtable-patch-failed(entry={}, target={})",
+                    interfaceName != nullptr ? interfaceName : "unknown",
+                    PointerToString(entry),
+                    AddressWithModuleToString(originalTarget)
+                )
+            );
+            return false;
+        }
+    }
+
+    CreateDescriptorHeapVTablePatchState &patchState =
+        s_createDescriptorHeapVTablePatches[s_createDescriptorHeapVTablePatchCount++];
+    patchState.interfaceName = interfaceName;
+    patchState.entry = entry;
+    patchState.originalTarget = originalTarget;
+    patchState.hookIndex = hookIndex;
+
+    AppendDiagnosticInfo(
+        diagnosticReport,
+        std::format(
+            "{}=vtable-patched(entry={}, target={}, hookSlot={})",
+            interfaceName != nullptr ? interfaceName : "unknown",
+            PointerToString(entry),
+            AddressWithModuleToString(originalTarget),
+            hookIndex
+        )
+    );
+    return true;
+}
+
 static void DisableCreateDescriptorHeapHooks() {
+    for (size_t i = 0; i < s_createDescriptorHeapVTablePatchCount; ++i) {
+        const CreateDescriptorHeapVTablePatchState &patchState = s_createDescriptorHeapVTablePatches[i];
+        if (patchState.entry == nullptr || patchState.originalTarget == nullptr) {
+            continue;
+        }
+
+        if (!PatchPointerWithWritableProtection(patchState.entry, patchState.originalTarget)) {
+            LogError(std::format(
+                "Failed to restore CreateDescriptorHeap vtable patch for {} at entry={}.",
+                patchState.interfaceName != nullptr ? patchState.interfaceName : "unknown",
+                PointerToString(patchState.entry)
+            ));
+        }
+    }
+
+    s_createDescriptorHeapVTablePatchCount = 0;
+    s_createDescriptorHeapVTablePatches = {};
+
     for (size_t i = 0; i < s_createDescriptorHeapHookCount; ++i) {
         CreateDescriptorHeapHookState &hookState = s_createDescriptorHeapHooks[i];
         if (hookState.hook == nullptr) {
+            hookState = {};
             continue;
         }
 
@@ -751,6 +1052,7 @@ static void TryInstallCreateDescriptorHeapHookForInterface(
     }
 
     void **pDeviceVTable = *reinterpret_cast<void ***>(pInterface.Get());
+    void **pCreateDescriptorHeapEntry = &pDeviceVTable[kCreateDescriptorHeapVTableIndex];
     void *fnCreateDescriptorHeap = pDeviceVTable[kCreateDescriptorHeapVTableIndex];
     if (fnCreateDescriptorHeap == nullptr) {
         AppendDiagnosticInfo(
@@ -760,42 +1062,57 @@ static void TryInstallCreateDescriptorHeapHookForInterface(
         return;
     }
 
-    if (!seenTargets.insert(fnCreateDescriptorHeap).second) {
-        AppendDiagnosticInfo(
-            diagnosticReport,
-            std::format("{}=duplicate({})", interfaceName, AddressWithModuleToString(fnCreateDescriptorHeap))
-        );
-        return;
+    size_t hookIndex = FindCreateDescriptorHeapHookIndexByTarget(fnCreateDescriptorHeap);
+    if (hookIndex == SIZE_MAX) {
+        if (s_createDescriptorHeapHookCount >= s_createDescriptorHeapHooks.size()) {
+            AppendDiagnosticInfo(
+                diagnosticReport,
+                std::format("{}=capacity-exceeded", interfaceName)
+            );
+            return;
+        }
+
+        hookIndex = s_createDescriptorHeapHookCount;
+        CreateDescriptorHeapHookState &hookState = s_createDescriptorHeapHooks[hookIndex];
+        hookState.interfaceName = interfaceName;
+        hookState.target = fnCreateDescriptorHeap;
+        hookState.original = reinterpret_cast<t_CreateDescriptorHeap>(fnCreateDescriptorHeap);
+        s_createDescriptorHeapHookCount = hookIndex + 1;
+
+        if (seenTargets.insert(fnCreateDescriptorHeap).second) {
+            hookState.hook = new HookWrapper<t_CreateDescriptorHeap>(fnCreateDescriptorHeap);
+            if (!hookState.hook->CreateAndEnable(kCreateDescriptorHeapDetours[hookIndex])) {
+                delete hookState.hook;
+                hookState.hook = nullptr;
+                AppendDiagnosticInfo(
+                    diagnosticReport,
+                    std::format("{}=minhook-failed({})", interfaceName, AddressWithModuleToString(fnCreateDescriptorHeap))
+                );
+            } else {
+                hookState.original = hookState.hook->GetOriginalPtr();
+                AppendDiagnosticInfo(
+                    diagnosticReport,
+                    std::format("{}=minhook({})", interfaceName, AddressWithModuleToString(fnCreateDescriptorHeap))
+                );
+            }
+        }
     }
 
-    if (s_createDescriptorHeapHookCount >= s_createDescriptorHeapHooks.size()) {
-        AppendDiagnosticInfo(
-            diagnosticReport,
-            std::format("{}=capacity-exceeded", interfaceName)
-        );
-        return;
-    }
-
-    const size_t hookIndex = s_createDescriptorHeapHookCount;
     CreateDescriptorHeapHookState &hookState = s_createDescriptorHeapHooks[hookIndex];
-    hookState.hook = new HookWrapper<t_CreateDescriptorHeap>(fnCreateDescriptorHeap);
-    hookState.interfaceName = interfaceName;
-    hookState.target = fnCreateDescriptorHeap;
-    s_createDescriptorHeapHookCount = hookIndex + 1;
-    if (!hookState.hook->CreateAndEnable(kCreateDescriptorHeapDetours[hookIndex])) {
-        delete hookState.hook;
-        hookState = {};
-        s_createDescriptorHeapHookCount = hookIndex;
+    if (hookState.original == nullptr) {
         AppendDiagnosticInfo(
             diagnosticReport,
-            std::format("{}=hook-failed({})", interfaceName, AddressWithModuleToString(fnCreateDescriptorHeap))
+            std::format("{}=missing-original({})", interfaceName, AddressWithModuleToString(fnCreateDescriptorHeap))
         );
         return;
     }
 
-    AppendDiagnosticInfo(
-        diagnosticReport,
-        std::format("{}={}", interfaceName, AddressWithModuleToString(fnCreateDescriptorHeap))
+    InstallCreateDescriptorHeapVTablePatch(
+        interfaceName,
+        pCreateDescriptorHeapEntry,
+        fnCreateDescriptorHeap,
+        hookIndex,
+        diagnosticReport
     );
 }
 
@@ -862,6 +1179,9 @@ static bool InstallCreateDescriptorHeapHooks(ID3D12Device *pDevice) {
 #endif
 #ifdef __ID3D12Device14_INTERFACE_DEFINED__
     TryInstallCreateDescriptorHeapHookForInterface<ID3D12Device14>(pDevice, "ID3D12Device14", seenTargets, diagnosticReport);
+#endif
+#ifdef __ID3D12Device15_INTERFACE_DEFINED__
+    TryInstallCreateDescriptorHeapHookForInterface<ID3D12Device15>(pDevice, "ID3D12Device15", seenTargets, diagnosticReport);
 #endif
 
     s_createDescriptorHeapHookReport = diagnosticReport.empty() ? "none" : diagnosticReport;
@@ -1341,24 +1661,28 @@ UNITY_INTERFACE_EXPORT uint32_t UNITY_INTERFACE_API WarmupPlugin() {
 }
 
 UNITY_INTERFACE_EXPORT uint32_t UNITY_INTERFACE_API GetSRVDescriptorHeapCount() {
-    if (s_descriptorHeapSelection.heap == nullptr) {
+    const DescriptorHeapSelectionState *selection = GetDescriptorHeapSelectionForQueries();
+    if (selection == nullptr) {
         LogDescriptorHeapUnavailable("Failed to get descriptor heap");
         return 0u;
     }
 
-    return s_descriptorHeapSelection.totalDescriptorCount;
+    return selection->totalDescriptorCount;
 }
 
 UNITY_INTERFACE_EXPORT uint32_t UNITY_INTERFACE_API GetBindlessDescriptorStartIndex() {
-    return HasPluginOwnedBindlessRange() ? s_descriptorHeapSelection.bindlessDescriptorStart : 0u;
+    const DescriptorHeapSelectionState *selection = GetBindlessDescriptorHeapSelection();
+    return selection != nullptr ? selection->bindlessDescriptorStart : 0u;
 }
 
 UNITY_INTERFACE_EXPORT uint32_t UNITY_INTERFACE_API GetBindlessDescriptorCount() {
-    return HasPluginOwnedBindlessRange() ? s_descriptorHeapSelection.bindlessDescriptorCount : 0u;
+    const DescriptorHeapSelectionState *selection = GetBindlessDescriptorHeapSelection();
+    return selection != nullptr ? selection->bindlessDescriptorCount : 0u;
 }
 
 UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateSRVDescriptor(ID3D12Resource *pTexture, uint32_t index) {
-    if (!HasPluginOwnedBindlessRange()) {
+    const DescriptorHeapSelectionState *selection = GetBindlessDescriptorHeapSelection();
+    if (selection == nullptr) {
         LogDescriptorHeapUnavailable("CreateSRVDescriptor failed because no plugin-owned bindless range is available");
         return false;
     }
@@ -1372,8 +1696,8 @@ UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateSRVDescriptor(ID3D12Resour
         LogError(std::format(
             "CreateSRVDescriptor failed because index {} is outside the bindless range [{}, {}).",
             index,
-            s_descriptorHeapSelection.bindlessDescriptorStart,
-            s_descriptorHeapSelection.bindlessDescriptorStart + s_descriptorHeapSelection.bindlessDescriptorCount
+            selection->bindlessDescriptorStart,
+            selection->bindlessDescriptorStart + selection->bindlessDescriptorCount
         ));
         return false;
     }
@@ -1385,9 +1709,17 @@ UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateSRVDescriptor(ID3D12Resour
         return false;
     }
 
-    const SIZE_T ptrOffset = static_cast<SIZE_T>(index) * s_descriptorHeapSelection.incrementSize;
+    const UINT incrementSize = selection->incrementSize != 0
+        ? selection->incrementSize
+        : pDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (selection->cpuDescriptorHandleForHeapStart == 0 || incrementSize == 0) {
+        LogDescriptorHeapUnavailable("CreateSRVDescriptor failed because the selected descriptor heap has invalid CPU start or increment size");
+        return false;
+    }
+
+    const SIZE_T ptrOffset = static_cast<SIZE_T>(index) * incrementSize;
     const D3D12_CPU_DESCRIPTOR_HANDLE descriptorHandle = {
-        s_descriptorHeapSelection.cpuDescriptorHandleForHeapStart + ptrOffset
+        selection->cpuDescriptorHandleForHeapStart + ptrOffset
     };
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -1421,7 +1753,8 @@ UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateSRVDescriptor(ID3D12Resour
 }
 
 UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateUAVDescriptor(ID3D12Resource *pTexture, uint32_t index) {
-    if (!HasPluginOwnedBindlessRange()) {
+    const DescriptorHeapSelectionState *selection = GetBindlessDescriptorHeapSelection();
+    if (selection == nullptr) {
         LogDescriptorHeapUnavailable("CreateUAVDescriptor failed because no plugin-owned bindless range is available");
         return false;
     }
@@ -1435,8 +1768,8 @@ UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateUAVDescriptor(ID3D12Resour
         LogError(std::format(
             "CreateUAVDescriptor failed because index {} is outside the bindless range [{}, {}).",
             index,
-            s_descriptorHeapSelection.bindlessDescriptorStart,
-            s_descriptorHeapSelection.bindlessDescriptorStart + s_descriptorHeapSelection.bindlessDescriptorCount
+            selection->bindlessDescriptorStart,
+            selection->bindlessDescriptorStart + selection->bindlessDescriptorCount
         ));
         return false;
     }
@@ -1448,9 +1781,17 @@ UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateUAVDescriptor(ID3D12Resour
         return false;
     }
 
-    const SIZE_T ptrOffset = static_cast<SIZE_T>(index) * s_descriptorHeapSelection.incrementSize;
+    const UINT incrementSize = selection->incrementSize != 0
+        ? selection->incrementSize
+        : pDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (selection->cpuDescriptorHandleForHeapStart == 0 || incrementSize == 0) {
+        LogDescriptorHeapUnavailable("CreateUAVDescriptor failed because the selected descriptor heap has invalid CPU start or increment size");
+        return false;
+    }
+
+    const SIZE_T ptrOffset = static_cast<SIZE_T>(index) * incrementSize;
     const D3D12_CPU_DESCRIPTOR_HANDLE descriptorHandle = {
-        s_descriptorHeapSelection.cpuDescriptorHandleForHeapStart + ptrOffset
+        selection->cpuDescriptorHandleForHeapStart + ptrOffset
     };
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
