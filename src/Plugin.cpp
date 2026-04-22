@@ -41,19 +41,59 @@ typedef HRESULT (*t_CreateDescriptorHeap)(
     REFIID riid,
     void **ppvHeap);
 
+typedef HRESULT (*t_CreateCommandList)(
+    ID3D12Device *pThis,
+    UINT nodeMask,
+    D3D12_COMMAND_LIST_TYPE type,
+    ID3D12CommandAllocator *pCommandAllocator,
+    ID3D12PipelineState *pInitialState,
+    REFIID riid,
+    void **ppCommandList);
+
+typedef HRESULT (*t_CreateCommandList1)(
+    ID3D12Device4 *pThis,
+    UINT nodeMask,
+    D3D12_COMMAND_LIST_TYPE type,
+    D3D12_COMMAND_LIST_FLAGS flags,
+    REFIID riid,
+    void **ppCommandList);
+
 typedef void (*t_SetDescriptorHeaps)(
     ID3D12GraphicsCommandList *pThis,
     UINT NumDescriptorHeaps,
     ID3D12DescriptorHeap *const *ppDescriptorHeaps);
 
+typedef HRESULT (*t_Reset)(
+    ID3D12GraphicsCommandList *pThis,
+    ID3D12CommandAllocator *pAllocator,
+    ID3D12PipelineState *pInitialState);
+
 static constexpr UINT kMainDescriptorHeapMinCount = 262144u;
 static constexpr UINT kBindlessDescriptorReserveCount = 4096u * 4u;
 static constexpr UINT kAbsoluteMaxDescriptorCount = 1000000u;
+static constexpr size_t kCreateCommandListVTableIndex = 12u;
+static constexpr size_t kCreateCommandList1VTableIndex = 54u;
 static constexpr size_t kCreateDescriptorHeapVTableIndex = 14u;
+static constexpr size_t kResetVTableIndex = 10u;
 static constexpr size_t kSetDescriptorHeapsVTableIndex = 28u;
+static constexpr size_t kMaxCreateCommandListHookSlots = 16u;
+static constexpr size_t kMaxCreateCommandList1HookSlots = 16u;
 static constexpr size_t kMaxCreateDescriptorHeapHookSlots = 16u;
 static constexpr size_t kMaxCreateDescriptorHeapVTablePatchSlots = 32u;
+static constexpr size_t kMaxResetHookSlots = 64u;
 static constexpr size_t kMaxSetDescriptorHeapsHookSlots = 64u;
+
+struct CreateCommandListHookState {
+    HookWrapper<t_CreateCommandList> *hook = nullptr;
+    const char *interfaceName = nullptr;
+    void *target = nullptr;
+};
+
+struct CreateCommandList1HookState {
+    HookWrapper<t_CreateCommandList1> *hook = nullptr;
+    const char *interfaceName = nullptr;
+    void *target = nullptr;
+};
 
 struct CreateDescriptorHeapHookState {
     HookWrapper<t_CreateDescriptorHeap> *hook = nullptr;
@@ -71,6 +111,12 @@ struct CreateDescriptorHeapVTablePatchState {
 
 struct SetDescriptorHeapsHookState {
     HookWrapper<t_SetDescriptorHeaps> *hook = nullptr;
+    std::string label;
+    void *target = nullptr;
+};
+
+struct ResetHookState {
+    HookWrapper<t_Reset> *hook = nullptr;
     std::string label;
     void *target = nullptr;
 };
@@ -99,13 +145,22 @@ struct DescriptorHeapSelectionState {
 };
 
 static HookWrapper<t_D3D12SerializeRootSignature> *s_pSerializeRootSignatureHook = nullptr;
+static std::array<CreateCommandListHookState, kMaxCreateCommandListHookSlots> s_createCommandListHooks = {};
+static size_t s_createCommandListHookCount = 0;
+static std::array<CreateCommandList1HookState, kMaxCreateCommandList1HookSlots> s_createCommandList1Hooks = {};
+static size_t s_createCommandList1HookCount = 0;
 static std::array<CreateDescriptorHeapHookState, kMaxCreateDescriptorHeapHookSlots> s_createDescriptorHeapHooks = {};
 static size_t s_createDescriptorHeapHookCount = 0;
 static std::array<CreateDescriptorHeapVTablePatchState, kMaxCreateDescriptorHeapVTablePatchSlots> s_createDescriptorHeapVTablePatches = {};
 static size_t s_createDescriptorHeapVTablePatchCount = 0;
+static std::array<ResetHookState, kMaxResetHookSlots> s_resetHooks = {};
+static size_t s_resetHookCount = 0;
 static std::array<SetDescriptorHeapsHookState, kMaxSetDescriptorHeapsHookSlots> s_setDescriptorHeapsHooks = {};
 static size_t s_setDescriptorHeapsHookCount = 0;
+static std::string s_createCommandListHookReport = "not attempted";
+static std::string s_createCommandList1HookReport = "not attempted";
 static std::string s_createDescriptorHeapHookReport = "not attempted";
+static std::string s_resetHookReport = "not attempted";
 static std::string s_setDescriptorHeapsHookReport = "not attempted";
 static std::unordered_map<ID3D12DescriptorHeap *, DescriptorHeapMetadata> s_descriptorHeapMetadata = {};
 static std::unordered_map<SIZE_T, DescriptorHeapMetadata> s_descriptorHeapMetadataByCpuStart = {};
@@ -113,6 +168,25 @@ static DescriptorHeapSelectionState s_descriptorHeapSelection = {};
 static DescriptorHeapSelectionState s_pluginOwnedDescriptorHeapSelection = {};
 static std::string s_lastDescriptorHeapUnavailableMessage;
 static uint64_t s_setDescriptorHeapsObservedCount = 0;
+static thread_local uint32_t s_createDescriptorHeapDetourDepth = 0;
+
+struct ScopedCreateDescriptorHeapDetourDepth {
+    ScopedCreateDescriptorHeapDetourDepth()
+        : m_isReentrant(s_createDescriptorHeapDetourDepth > 0) {
+        ++s_createDescriptorHeapDetourDepth;
+    }
+
+    ~ScopedCreateDescriptorHeapDetourDepth() {
+        --s_createDescriptorHeapDetourDepth;
+    }
+
+    [[nodiscard]] bool IsReentrant() const {
+        return m_isReentrant;
+    }
+
+private:
+    bool m_isReentrant = false;
+};
 
 static void LogInfo(const std::string &message) {
     if (g_Log != nullptr) {
@@ -264,6 +338,77 @@ static std::string BuildCreateDescriptorHeapHookInfo() {
                 hookState.interfaceName != nullptr ? hookState.interfaceName : "unknown",
                 AddressWithModuleToString(hookState.target)
             )
+        );
+    }
+
+    return result.empty() ? "none" : result;
+}
+
+static std::string BuildCreateCommandListHookInfo() {
+    if (s_createCommandListHookCount == 0) {
+        return "none";
+    }
+
+    std::string result;
+    for (size_t i = 0; i < s_createCommandListHookCount; ++i) {
+        const CreateCommandListHookState &hookState = s_createCommandListHooks[i];
+        if (hookState.hook == nullptr) {
+            continue;
+        }
+
+        AppendDiagnosticInfo(
+            result,
+            std::format(
+                "{}={}",
+                hookState.interfaceName != nullptr ? hookState.interfaceName : "unknown",
+                AddressWithModuleToString(hookState.target)
+            )
+        );
+    }
+
+    return result.empty() ? "none" : result;
+}
+
+static std::string BuildCreateCommandList1HookInfo() {
+    if (s_createCommandList1HookCount == 0) {
+        return "none";
+    }
+
+    std::string result;
+    for (size_t i = 0; i < s_createCommandList1HookCount; ++i) {
+        const CreateCommandList1HookState &hookState = s_createCommandList1Hooks[i];
+        if (hookState.hook == nullptr) {
+            continue;
+        }
+
+        AppendDiagnosticInfo(
+            result,
+            std::format(
+                "{}={}",
+                hookState.interfaceName != nullptr ? hookState.interfaceName : "unknown",
+                AddressWithModuleToString(hookState.target)
+            )
+        );
+    }
+
+    return result.empty() ? "none" : result;
+}
+
+static std::string BuildResetHookInfo() {
+    if (s_resetHookCount == 0) {
+        return "none";
+    }
+
+    std::string result;
+    for (size_t i = 0; i < s_resetHookCount; ++i) {
+        const ResetHookState &hookState = s_resetHooks[i];
+        if (hookState.hook == nullptr) {
+            continue;
+        }
+
+        AppendDiagnosticInfo(
+            result,
+            std::format("{}={}", hookState.label, AddressWithModuleToString(hookState.target))
         );
     }
 
@@ -472,6 +617,73 @@ static const DescriptorHeapSelectionState *GetBindlessDescriptorHeapSelection() 
     }
 
     return nullptr;
+}
+
+static const DescriptorHeapSelectionState *GetDescriptorHeapSelectionForPrebind() {
+    const DescriptorHeapSelectionState *bindlessSelection = GetBindlessDescriptorHeapSelection();
+    if (bindlessSelection != nullptr && bindlessSelection->heap != nullptr) {
+        return bindlessSelection;
+    }
+
+    return GetDescriptorHeapSelectionForQueries();
+}
+
+static t_SetDescriptorHeaps ResolveOriginalSetDescriptorHeaps(
+    ID3D12GraphicsCommandList *pCommandList
+) {
+    if (pCommandList == nullptr) {
+        return nullptr;
+    }
+
+    void **pCommandListVTable = *reinterpret_cast<void ***>(pCommandList);
+    void *fnSetDescriptorHeaps = pCommandListVTable[kSetDescriptorHeapsVTableIndex];
+    for (size_t i = 0; i < s_setDescriptorHeapsHookCount; ++i) {
+        const SetDescriptorHeapsHookState &hookState = s_setDescriptorHeapsHooks[i];
+        if (hookState.target == fnSetDescriptorHeaps && hookState.hook != nullptr) {
+            return hookState.hook->GetOriginalPtr();
+        }
+    }
+
+    return reinterpret_cast<t_SetDescriptorHeaps>(fnSetDescriptorHeaps);
+}
+
+static void PrebindDescriptorHeapIfAvailable(
+    ID3D12GraphicsCommandList *pCommandList,
+    const D3D12_COMMAND_LIST_TYPE commandListType
+) {
+    if (pCommandList == nullptr || commandListType != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        return;
+    }
+
+    const DescriptorHeapSelectionState *selection = GetDescriptorHeapSelectionForPrebind();
+    if (selection == nullptr || !IsShaderVisibleCBVSRVUAVHeap(selection->heap)) {
+        return;
+    }
+
+    const t_SetDescriptorHeaps originalSetDescriptorHeaps = ResolveOriginalSetDescriptorHeaps(pCommandList);
+    if (originalSetDescriptorHeaps == nullptr) {
+        return;
+    }
+
+    ID3D12DescriptorHeap *heaps[] = {selection->heap};
+    originalSetDescriptorHeaps(pCommandList, static_cast<UINT>(std::size(heaps)), heaps);
+}
+
+static void PrebindDescriptorHeapForCreatedCommandListIfAvailable(
+    void *pCommandListObject,
+    const D3D12_COMMAND_LIST_TYPE commandListType
+) {
+    if (pCommandListObject == nullptr || commandListType != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> pGraphicsCommandList;
+    IUnknown *pUnknown = reinterpret_cast<IUnknown *>(pCommandListObject);
+    if (FAILED(pUnknown->QueryInterface(IID_PPV_ARGS(pGraphicsCommandList.GetAddressOf())))) {
+        return;
+    }
+
+    PrebindDescriptorHeapIfAvailable(pGraphicsCommandList.Get(), commandListType);
 }
 
 static void CachePluginOwnedDescriptorHeap(
@@ -706,7 +918,6 @@ static HRESULT WINAPI DetourD3D12SerializeRootSignature(
     D3D12_ROOT_SIGNATURE_DESC desc = *pRootSignature;
     if ((desc.Flags & D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE) == 0) {
         desc.Flags |= D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
-        desc.Flags |= D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
     }
 
     const HRESULT result = s_pSerializeRootSignatureHook->GetOriginalPtr()(&desc, Version, ppBlob, ppErrorBlob);
@@ -716,6 +927,197 @@ static HRESULT WINAPI DetourD3D12SerializeRootSignature(
 
     return result;
 }
+
+static HRESULT DetourCreateCommandListImpl(
+    size_t hookIndex,
+    ID3D12Device *pThis,
+    UINT nodeMask,
+    D3D12_COMMAND_LIST_TYPE type,
+    ID3D12CommandAllocator *pCommandAllocator,
+    ID3D12PipelineState *pInitialState,
+    REFIID riid,
+    void **ppCommandList
+) {
+    if (hookIndex >= s_createCommandListHookCount) {
+        LogError(std::format(
+            "DetourCreateCommandList invoked with invalid hook slot {}.",
+            hookIndex
+        ));
+        return E_FAIL;
+    }
+
+    const CreateCommandListHookState &hookState = s_createCommandListHooks[hookIndex];
+    if (hookState.hook == nullptr) {
+        LogError(std::format(
+            "DetourCreateCommandList invoked with missing hook state at slot {}.",
+            hookIndex
+        ));
+        return E_FAIL;
+    }
+
+    const HRESULT hr = hookState.hook->GetOriginalPtr()(
+        pThis,
+        nodeMask,
+        type,
+        pCommandAllocator,
+        pInitialState,
+        riid,
+        ppCommandList
+    );
+    if (SUCCEEDED(hr) && ppCommandList != nullptr && *ppCommandList != nullptr) {
+        PrebindDescriptorHeapForCreatedCommandListIfAvailable(*ppCommandList, type);
+    }
+
+    return hr;
+}
+
+template<size_t HookIndex>
+static HRESULT WINAPI DetourCreateCommandListSlot(
+    ID3D12Device *pThis,
+    UINT nodeMask,
+    D3D12_COMMAND_LIST_TYPE type,
+    ID3D12CommandAllocator *pCommandAllocator,
+    ID3D12PipelineState *pInitialState,
+    REFIID riid,
+    void **ppCommandList
+) {
+    return DetourCreateCommandListImpl(
+        HookIndex,
+        pThis,
+        nodeMask,
+        type,
+        pCommandAllocator,
+        pInitialState,
+        riid,
+        ppCommandList
+    );
+}
+
+template<size_t... Indices>
+static constexpr std::array<t_CreateCommandList, sizeof...(Indices)> MakeCreateCommandListDetours(
+    std::index_sequence<Indices...>
+) {
+    return {&DetourCreateCommandListSlot<Indices>...};
+}
+
+static constexpr auto kCreateCommandListDetours = MakeCreateCommandListDetours(
+    std::make_index_sequence<kMaxCreateCommandListHookSlots>()
+);
+
+static HRESULT DetourCreateCommandList1Impl(
+    size_t hookIndex,
+    ID3D12Device4 *pThis,
+    UINT nodeMask,
+    D3D12_COMMAND_LIST_TYPE type,
+    D3D12_COMMAND_LIST_FLAGS flags,
+    REFIID riid,
+    void **ppCommandList
+) {
+    if (hookIndex >= s_createCommandList1HookCount) {
+        LogError(std::format(
+            "DetourCreateCommandList1 invoked with invalid hook slot {}.",
+            hookIndex
+        ));
+        return E_FAIL;
+    }
+
+    const CreateCommandList1HookState &hookState = s_createCommandList1Hooks[hookIndex];
+    if (hookState.hook == nullptr) {
+        LogError(std::format(
+            "DetourCreateCommandList1 invoked with missing hook state at slot {}.",
+            hookIndex
+        ));
+        return E_FAIL;
+    }
+
+    const HRESULT hr = hookState.hook->GetOriginalPtr()(
+        pThis,
+        nodeMask,
+        type,
+        flags,
+        riid,
+        ppCommandList
+    );
+    if (SUCCEEDED(hr) && ppCommandList != nullptr && *ppCommandList != nullptr) {
+        PrebindDescriptorHeapForCreatedCommandListIfAvailable(*ppCommandList, type);
+    }
+
+    return hr;
+}
+
+template<size_t HookIndex>
+static HRESULT WINAPI DetourCreateCommandList1Slot(
+    ID3D12Device4 *pThis,
+    UINT nodeMask,
+    D3D12_COMMAND_LIST_TYPE type,
+    D3D12_COMMAND_LIST_FLAGS flags,
+    REFIID riid,
+    void **ppCommandList
+) {
+    return DetourCreateCommandList1Impl(HookIndex, pThis, nodeMask, type, flags, riid, ppCommandList);
+}
+
+template<size_t... Indices>
+static constexpr std::array<t_CreateCommandList1, sizeof...(Indices)> MakeCreateCommandList1Detours(
+    std::index_sequence<Indices...>
+) {
+    return {&DetourCreateCommandList1Slot<Indices>...};
+}
+
+static constexpr auto kCreateCommandList1Detours = MakeCreateCommandList1Detours(
+    std::make_index_sequence<kMaxCreateCommandList1HookSlots>()
+);
+
+static HRESULT DetourResetImpl(
+    size_t hookIndex,
+    ID3D12GraphicsCommandList *pThis,
+    ID3D12CommandAllocator *pAllocator,
+    ID3D12PipelineState *pInitialState
+) {
+    if (hookIndex >= s_resetHookCount) {
+        LogError(std::format(
+            "DetourReset invoked with invalid hook slot {}.",
+            hookIndex
+        ));
+        return E_FAIL;
+    }
+
+    const ResetHookState &hookState = s_resetHooks[hookIndex];
+    if (hookState.hook == nullptr) {
+        LogError(std::format(
+            "DetourReset invoked with missing hook state at slot {}.",
+            hookIndex
+        ));
+        return E_FAIL;
+    }
+
+    const HRESULT hr = hookState.hook->GetOriginalPtr()(pThis, pAllocator, pInitialState);
+    if (SUCCEEDED(hr) && pThis != nullptr) {
+        PrebindDescriptorHeapIfAvailable(pThis, pThis->GetType());
+    }
+
+    return hr;
+}
+
+template<size_t HookIndex>
+static HRESULT WINAPI DetourResetSlot(
+    ID3D12GraphicsCommandList *pThis,
+    ID3D12CommandAllocator *pAllocator,
+    ID3D12PipelineState *pInitialState
+) {
+    return DetourResetImpl(HookIndex, pThis, pAllocator, pInitialState);
+}
+
+template<size_t... Indices>
+static constexpr std::array<t_Reset, sizeof...(Indices)> MakeResetDetours(
+    std::index_sequence<Indices...>
+) {
+    return {&DetourResetSlot<Indices>...};
+}
+
+static constexpr auto kResetDetours = MakeResetDetours(
+    std::make_index_sequence<kMaxResetHookSlots>()
+);
 
 template<size_t HookIndex>
 static void WINAPI DetourSetDescriptorHeapsSlot(
@@ -796,12 +1198,17 @@ static HRESULT DetourCreateDescriptorHeapImpl(
     }
 
     const CreateDescriptorHeapHookState &hookState = s_createDescriptorHeapHooks[hookIndex];
+    ScopedCreateDescriptorHeapDetourDepth detourDepthGuard;
     if (hookState.original == nullptr) {
         LogError(std::format(
             "DetourCreateDescriptorHeap invoked with missing original function at slot {}.",
             hookIndex
         ));
         return E_FAIL;
+    }
+
+    if (detourDepthGuard.IsReentrant()) {
+        return hookState.original(pThis, pDescriptorHeapDesc, riid, ppvHeap);
     }
 
     D3D12_DESCRIPTOR_HEAP_DESC patchedDescriptorHeapDesc = {};
@@ -1034,6 +1441,538 @@ static void DisableSetDescriptorHeapsHooks() {
     s_setDescriptorHeapsHookCount = 0;
     s_setDescriptorHeapsHookReport = "not attempted";
 }
+
+static void DisableResetHooks() {
+    for (size_t i = 0; i < s_resetHookCount; ++i) {
+        ResetHookState &hookState = s_resetHooks[i];
+        if (hookState.hook == nullptr) {
+            continue;
+        }
+
+        hookState.hook->Disable();
+        delete hookState.hook;
+        hookState = {};
+    }
+
+    s_resetHookCount = 0;
+    s_resetHookReport = "not attempted";
+}
+
+static void DisableCreateCommandListHooks() {
+    for (size_t i = 0; i < s_createCommandListHookCount; ++i) {
+        CreateCommandListHookState &hookState = s_createCommandListHooks[i];
+        if (hookState.hook == nullptr) {
+            continue;
+        }
+
+        hookState.hook->Disable();
+        delete hookState.hook;
+        hookState = {};
+    }
+
+    for (size_t i = 0; i < s_createCommandList1HookCount; ++i) {
+        CreateCommandList1HookState &hookState = s_createCommandList1Hooks[i];
+        if (hookState.hook == nullptr) {
+            continue;
+        }
+
+        hookState.hook->Disable();
+        delete hookState.hook;
+        hookState = {};
+    }
+
+    s_createCommandListHookCount = 0;
+    s_createCommandList1HookCount = 0;
+    s_createCommandListHookReport = "not attempted";
+    s_createCommandList1HookReport = "not attempted";
+}
+
+template<typename TDeviceInterface>
+static void TryInstallCreateCommandListHookForInterface(
+    ID3D12Device *pDevice,
+    const char *interfaceName,
+    std::unordered_set<void *> &seenTargets,
+    std::string &diagnosticReport
+) {
+    Microsoft::WRL::ComPtr<TDeviceInterface> pInterface;
+    const HRESULT hr = pDevice->QueryInterface(IID_PPV_ARGS(pInterface.GetAddressOf()));
+    if (FAILED(hr) || pInterface == nullptr) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=hr=0x{:08X}", interfaceName, static_cast<uint32_t>(hr))
+        );
+        return;
+    }
+
+    void **pDeviceVTable = *reinterpret_cast<void ***>(pInterface.Get());
+    void *fnCreateCommandList = pDeviceVTable[kCreateCommandListVTableIndex];
+    if (fnCreateCommandList == nullptr) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=null-target", interfaceName)
+        );
+        return;
+    }
+
+    if (!seenTargets.insert(fnCreateCommandList).second) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=duplicate({})", interfaceName, AddressWithModuleToString(fnCreateCommandList))
+        );
+        return;
+    }
+
+    if (s_createCommandListHookCount >= s_createCommandListHooks.size()) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=capacity-exceeded", interfaceName)
+        );
+        return;
+    }
+
+    const size_t hookIndex = s_createCommandListHookCount;
+    CreateCommandListHookState &hookState = s_createCommandListHooks[hookIndex];
+    hookState.hook = new HookWrapper<t_CreateCommandList>(fnCreateCommandList);
+    hookState.interfaceName = interfaceName;
+    hookState.target = fnCreateCommandList;
+    s_createCommandListHookCount = hookIndex + 1;
+    if (!hookState.hook->CreateAndEnable(kCreateCommandListDetours[hookIndex])) {
+        delete hookState.hook;
+        hookState = {};
+        s_createCommandListHookCount = hookIndex;
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=hook-failed({})", interfaceName, AddressWithModuleToString(fnCreateCommandList))
+        );
+        return;
+    }
+
+    AppendDiagnosticInfo(
+        diagnosticReport,
+        std::format("{}={}", interfaceName, AddressWithModuleToString(fnCreateCommandList))
+    );
+}
+
+template<typename TDeviceInterface>
+static void TryInstallCreateCommandList1HookForInterface(
+    ID3D12Device *pDevice,
+    const char *interfaceName,
+    std::unordered_set<void *> &seenTargets,
+    std::string &diagnosticReport
+) {
+    Microsoft::WRL::ComPtr<TDeviceInterface> pInterface;
+    const HRESULT hr = pDevice->QueryInterface(IID_PPV_ARGS(pInterface.GetAddressOf()));
+    if (FAILED(hr) || pInterface == nullptr) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=hr=0x{:08X}", interfaceName, static_cast<uint32_t>(hr))
+        );
+        return;
+    }
+
+    void **pDeviceVTable = *reinterpret_cast<void ***>(pInterface.Get());
+    void *fnCreateCommandList1 = pDeviceVTable[kCreateCommandList1VTableIndex];
+    if (fnCreateCommandList1 == nullptr) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=null-target", interfaceName)
+        );
+        return;
+    }
+
+    if (!seenTargets.insert(fnCreateCommandList1).second) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=duplicate({})", interfaceName, AddressWithModuleToString(fnCreateCommandList1))
+        );
+        return;
+    }
+
+    if (s_createCommandList1HookCount >= s_createCommandList1Hooks.size()) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=capacity-exceeded", interfaceName)
+        );
+        return;
+    }
+
+    const size_t hookIndex = s_createCommandList1HookCount;
+    CreateCommandList1HookState &hookState = s_createCommandList1Hooks[hookIndex];
+    hookState.hook = new HookWrapper<t_CreateCommandList1>(fnCreateCommandList1);
+    hookState.interfaceName = interfaceName;
+    hookState.target = fnCreateCommandList1;
+    s_createCommandList1HookCount = hookIndex + 1;
+    if (!hookState.hook->CreateAndEnable(kCreateCommandList1Detours[hookIndex])) {
+        delete hookState.hook;
+        hookState = {};
+        s_createCommandList1HookCount = hookIndex;
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=hook-failed({})", interfaceName, AddressWithModuleToString(fnCreateCommandList1))
+        );
+        return;
+    }
+
+    AppendDiagnosticInfo(
+        diagnosticReport,
+        std::format("{}={}", interfaceName, AddressWithModuleToString(fnCreateCommandList1))
+    );
+}
+
+#define TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(interfaceType) \
+    TryInstallCreateCommandListHookForInterface<interfaceType>( \
+        pDevice, \
+        #interfaceType, \
+        seenTargets, \
+        diagnosticReport \
+    )
+
+static bool InstallCreateCommandListHooks(ID3D12Device *pDevice) {
+    if (s_createCommandListHookCount > 0) {
+        return true;
+    }
+
+    if (pDevice == nullptr) {
+        LogError("Cannot install CreateCommandList hooks because D3D12 device is null.");
+        return false;
+    }
+
+    std::unordered_set<void *> seenTargets;
+    std::string diagnosticReport;
+    AppendDiagnosticInfo(
+        diagnosticReport,
+        std::format("d3d12={}", ModuleHandleToString(GetModuleHandleW(L"d3d12.dll")))
+    );
+
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device);
+#ifdef __ID3D12Device1_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device1);
+#endif
+#ifdef __ID3D12Device2_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device2);
+#endif
+#ifdef __ID3D12Device3_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device3);
+#endif
+#ifdef __ID3D12Device4_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device4);
+#endif
+#ifdef __ID3D12Device5_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device5);
+#endif
+#ifdef __ID3D12Device6_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device6);
+#endif
+#ifdef __ID3D12Device7_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device7);
+#endif
+#ifdef __ID3D12Device8_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device8);
+#endif
+#ifdef __ID3D12Device9_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device9);
+#endif
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device10);
+#endif
+#ifdef __ID3D12Device11_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device11);
+#endif
+#ifdef __ID3D12Device12_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device12);
+#endif
+#ifdef __ID3D12Device13_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device13);
+#endif
+#ifdef __ID3D12Device14_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device14);
+#endif
+#ifdef __ID3D12Device15_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST_HOOK(ID3D12Device15);
+#endif
+
+    s_createCommandListHookReport = diagnosticReport.empty() ? "none" : diagnosticReport;
+    if (s_createCommandListHookCount == 0) {
+        LogError(std::format(
+            "Failed to install CreateCommandList hooks. report={}",
+            s_createCommandListHookReport
+        ));
+        return false;
+    }
+
+    LogInfo(std::format(
+        "Hooked CreateCommandList: {}",
+        BuildCreateCommandListHookInfo()
+    ));
+    return true;
+}
+
+#undef TRY_INSTALL_CREATE_COMMAND_LIST_HOOK
+
+#define TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(interfaceType) \
+    TryInstallCreateCommandList1HookForInterface<interfaceType>( \
+        pDevice, \
+        #interfaceType, \
+        seenTargets, \
+        diagnosticReport \
+    )
+
+static bool InstallCreateCommandList1Hooks(ID3D12Device *pDevice) {
+    if (s_createCommandList1HookCount > 0) {
+        return true;
+    }
+
+    if (pDevice == nullptr) {
+        LogError("Cannot install CreateCommandList1 hooks because D3D12 device is null.");
+        return false;
+    }
+
+    std::unordered_set<void *> seenTargets;
+    std::string diagnosticReport;
+    AppendDiagnosticInfo(
+        diagnosticReport,
+        std::format("d3d12={}", ModuleHandleToString(GetModuleHandleW(L"d3d12.dll")))
+    );
+
+#ifdef __ID3D12Device4_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device4);
+#endif
+#ifdef __ID3D12Device5_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device5);
+#endif
+#ifdef __ID3D12Device6_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device6);
+#endif
+#ifdef __ID3D12Device7_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device7);
+#endif
+#ifdef __ID3D12Device8_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device8);
+#endif
+#ifdef __ID3D12Device9_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device9);
+#endif
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device10);
+#endif
+#ifdef __ID3D12Device11_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device11);
+#endif
+#ifdef __ID3D12Device12_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device12);
+#endif
+#ifdef __ID3D12Device13_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device13);
+#endif
+#ifdef __ID3D12Device14_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device14);
+#endif
+#ifdef __ID3D12Device15_INTERFACE_DEFINED__
+    TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK(ID3D12Device15);
+#endif
+
+    s_createCommandList1HookReport = diagnosticReport.empty() ? "none" : diagnosticReport;
+    if (s_createCommandList1HookCount == 0) {
+        LogInfo(std::format(
+            "CreateCommandList1 hooks were not installed. report={}",
+            s_createCommandList1HookReport
+        ));
+        return true;
+    }
+
+    LogInfo(std::format(
+        "Hooked CreateCommandList1: {}",
+        BuildCreateCommandList1HookInfo()
+    ));
+    return true;
+}
+
+#undef TRY_INSTALL_CREATE_COMMAND_LIST1_HOOK
+
+template<typename TCommandListInterface>
+static void TryInstallResetHookForCommandListObject(
+    TCommandListInterface *pCommandList,
+    const char *label,
+    std::unordered_set<void *> &seenTargets,
+    std::string &diagnosticReport
+) {
+    if (pCommandList == nullptr) {
+        AppendDiagnosticInfo(diagnosticReport, std::format("{}=null-command-list", label));
+        return;
+    }
+
+    void **pCommandListVTable = *reinterpret_cast<void ***>(pCommandList);
+    void *fnReset = pCommandListVTable[kResetVTableIndex];
+    if (fnReset == nullptr) {
+        AppendDiagnosticInfo(diagnosticReport, std::format("{}=null-target", label));
+        return;
+    }
+
+    if (!seenTargets.insert(fnReset).second) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=duplicate({})", label, AddressWithModuleToString(fnReset))
+        );
+        return;
+    }
+
+    if (s_resetHookCount >= s_resetHooks.size()) {
+        AppendDiagnosticInfo(diagnosticReport, std::format("{}=capacity-exceeded", label));
+        return;
+    }
+
+    const size_t hookIndex = s_resetHookCount;
+    ResetHookState &hookState = s_resetHooks[hookIndex];
+    hookState.hook = new HookWrapper<t_Reset>(fnReset);
+    hookState.label = label;
+    hookState.target = fnReset;
+    s_resetHookCount = hookIndex + 1;
+    if (!hookState.hook->CreateAndEnable(kResetDetours[hookIndex])) {
+        delete hookState.hook;
+        hookState = {};
+        s_resetHookCount = hookIndex;
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=hook-failed({})", label, AddressWithModuleToString(fnReset))
+        );
+        return;
+    }
+
+    AppendDiagnosticInfo(
+        diagnosticReport,
+        std::format("{}={}", label, AddressWithModuleToString(fnReset))
+    );
+}
+
+template<typename TCommandListInterface>
+static void TryInstallResetHookViaCreateCommandList(
+    ID3D12Device *pDevice,
+    ID3D12CommandAllocator *pCommandAllocator,
+    const char *creationMethod,
+    const char *interfaceName,
+    std::unordered_set<void *> &seenTargets,
+    std::string &diagnosticReport
+) {
+    Microsoft::WRL::ComPtr<TCommandListInterface> pCommandList;
+    const HRESULT hr = pDevice->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        pCommandAllocator,
+        nullptr,
+        IID_PPV_ARGS(pCommandList.GetAddressOf())
+    );
+    const std::string label = std::format(
+        "{}:DIRECT:{}",
+        creationMethod,
+        interfaceName
+    );
+    if (FAILED(hr) || pCommandList == nullptr) {
+        AppendDiagnosticInfo(
+            diagnosticReport,
+            std::format("{}=hr=0x{:08X}", label, static_cast<uint32_t>(hr))
+        );
+        return;
+    }
+
+    TryInstallResetHookForCommandListObject(
+        pCommandList.Get(),
+        label.c_str(),
+        seenTargets,
+        diagnosticReport
+    );
+    pCommandList->Close();
+}
+
+#define TRY_INSTALL_RESET_HOOK(interfaceType) \
+    TryInstallResetHookViaCreateCommandList<interfaceType>( \
+        pDevice, \
+        pCommandAllocator.Get(), \
+        "CreateCommandList", \
+        #interfaceType, \
+        seenTargets, \
+        diagnosticReport \
+    )
+
+static bool InstallResetHooks(ID3D12Device *pDevice) {
+    if (s_resetHookCount > 0) {
+        return true;
+    }
+
+    if (pDevice == nullptr) {
+        LogError("Cannot install Reset hooks because D3D12 device is null.");
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> pCommandAllocator;
+    const HRESULT hr = pDevice->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(pCommandAllocator.GetAddressOf())
+    );
+    if (FAILED(hr)) {
+        LogError(std::format(
+            "Failed to create direct command allocator for Reset hooks: hr=0x{:08X}",
+            static_cast<uint32_t>(hr)
+        ));
+        return false;
+    }
+
+    std::unordered_set<void *> seenTargets;
+    std::string diagnosticReport;
+    AppendDiagnosticInfo(
+        diagnosticReport,
+        std::format("d3d12={}", ModuleHandleToString(GetModuleHandleW(L"d3d12.dll")))
+    );
+
+    TRY_INSTALL_RESET_HOOK(ID3D12GraphicsCommandList);
+#ifdef __ID3D12GraphicsCommandList1_INTERFACE_DEFINED__
+    TRY_INSTALL_RESET_HOOK(ID3D12GraphicsCommandList1);
+#endif
+#ifdef __ID3D12GraphicsCommandList2_INTERFACE_DEFINED__
+    TRY_INSTALL_RESET_HOOK(ID3D12GraphicsCommandList2);
+#endif
+#ifdef __ID3D12GraphicsCommandList3_INTERFACE_DEFINED__
+    TRY_INSTALL_RESET_HOOK(ID3D12GraphicsCommandList3);
+#endif
+#ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
+    TRY_INSTALL_RESET_HOOK(ID3D12GraphicsCommandList4);
+#endif
+#ifdef __ID3D12GraphicsCommandList5_INTERFACE_DEFINED__
+    TRY_INSTALL_RESET_HOOK(ID3D12GraphicsCommandList5);
+#endif
+#ifdef __ID3D12GraphicsCommandList6_INTERFACE_DEFINED__
+    TRY_INSTALL_RESET_HOOK(ID3D12GraphicsCommandList6);
+#endif
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+    TRY_INSTALL_RESET_HOOK(ID3D12GraphicsCommandList7);
+#endif
+#ifdef __ID3D12GraphicsCommandList8_INTERFACE_DEFINED__
+    TRY_INSTALL_RESET_HOOK(ID3D12GraphicsCommandList8);
+#endif
+#ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
+    TRY_INSTALL_RESET_HOOK(ID3D12GraphicsCommandList9);
+#endif
+#ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
+    TRY_INSTALL_RESET_HOOK(ID3D12GraphicsCommandList10);
+#endif
+
+    s_resetHookReport = diagnosticReport.empty() ? "none" : diagnosticReport;
+    if (s_resetHookCount == 0) {
+        LogError(std::format(
+            "Failed to install Reset hooks. report={}",
+            s_resetHookReport
+        ));
+        return false;
+    }
+
+    LogInfo(std::format(
+        "Hooked Reset: {}",
+        BuildResetHookInfo()
+    ));
+    return true;
+}
+
+#undef TRY_INSTALL_RESET_HOOK
+
 template<typename TDeviceInterface>
 static void TryInstallCreateDescriptorHeapHookForInterface(
     ID3D12Device *pDevice,
@@ -1573,6 +2512,15 @@ static void InitializeD3D12HooksIfPossible() {
     if (!InstallSetDescriptorHeapsHooks(pDevice)) {
         LogError("Failed to install SetDescriptorHeaps hooks.");
     }
+    if (!InstallResetHooks(pDevice)) {
+        LogError("Failed to install Reset hooks.");
+    }
+    if (!InstallCreateCommandListHooks(pDevice)) {
+        LogError("Failed to install CreateCommandList hooks.");
+    }
+    if (!InstallCreateCommandList1Hooks(pDevice)) {
+        LogError("Failed to install CreateCommandList1 hooks.");
+    }
 }
 extern "C" {
 //-------------------------------------------------------
@@ -1584,7 +2532,9 @@ static void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType ev
             InitializeD3D12HooksIfPossible();
             break;
         case kUnityGfxDeviceEventBeforeReset:
+            DisableCreateCommandListHooks();
             DisableCreateDescriptorHeapHooks();
+            DisableResetHooks();
             DisableSetDescriptorHeapsHooks();
             ResetDescriptorHeapTrackingState();
             break;
@@ -1592,10 +2542,15 @@ static void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType ev
             InitializeD3D12HooksIfPossible();
             break;
         case kUnityGfxDeviceEventShutdown:
+            DisableCreateCommandListHooks();
             DisableCreateDescriptorHeapHooks();
+            DisableResetHooks();
             DisableSetDescriptorHeapsHooks();
             ResetDescriptorHeapTrackingState();
+            s_createCommandListHookReport = "not attempted";
+            s_createCommandList1HookReport = "not attempted";
             s_createDescriptorHeapHookReport = "not attempted";
+            s_resetHookReport = "not attempted";
             break;
         default:
             break;
@@ -1639,7 +2594,9 @@ UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API UnityPluginUnload() {
         g_unityGraphics->UnregisterDeviceEventCallback(OnGraphicsDeviceEvent);
     }
 
+    DisableCreateCommandListHooks();
     DisableCreateDescriptorHeapHooks();
+    DisableResetHooks();
     DisableSetDescriptorHeapsHooks();
     ResetDescriptorHeapTrackingState();
     UninstallRootSignatureHook();
@@ -1653,7 +2610,10 @@ UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API UnityPluginUnload() {
     g_unityGraphics_D3D12 = nullptr;
     g_unityGraphics = nullptr;
     g_Log = nullptr;
+    s_createCommandListHookReport = "not attempted";
+    s_createCommandList1HookReport = "not attempted";
     s_createDescriptorHeapHookReport = "not attempted";
+    s_resetHookReport = "not attempted";
 }
 
 UNITY_INTERFACE_EXPORT uint32_t UNITY_INTERFACE_API WarmupPlugin() {
