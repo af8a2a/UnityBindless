@@ -2640,6 +2640,21 @@ UNITY_INTERFACE_EXPORT uint32_t UNITY_INTERFACE_API GetBindlessDescriptorCount()
     return selection != nullptr ? selection->bindlessDescriptorCount : 0u;
 }
 
+UNITY_INTERFACE_EXPORT uint64_t UNITY_INTERFACE_API GetCompletedFrameFenceValue() {
+    IUnityGraphicsD3D12v8 *pD3d12 = g_unityGraphics_D3D12 != nullptr
+        ? g_unityGraphics_D3D12
+        : (g_unityInterfaces != nullptr ? g_unityInterfaces->Get<IUnityGraphicsD3D12v8>() : nullptr);
+    ID3D12Fence *pFrameFence = pD3d12 != nullptr ? pD3d12->GetFrameFence() : nullptr;
+    return pFrameFence != nullptr ? pFrameFence->GetCompletedValue() : 0ull;
+}
+
+UNITY_INTERFACE_EXPORT uint64_t UNITY_INTERFACE_API GetPendingFrameFenceValue() {
+    IUnityGraphicsD3D12v8 *pD3d12 = g_unityGraphics_D3D12 != nullptr
+        ? g_unityGraphics_D3D12
+        : (g_unityInterfaces != nullptr ? g_unityInterfaces->Get<IUnityGraphicsD3D12v8>() : nullptr);
+    return pD3d12 != nullptr ? pD3d12->GetNextFrameFenceValue() : 0ull;
+}
+
 UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateSRVDescriptor(ID3D12Resource *pTexture, uint32_t index) {
     const DescriptorHeapSelectionState *selection = GetBindlessDescriptorHeapSelection();
     if (selection == nullptr) {

@@ -15,6 +15,10 @@ UNITY_INTERFACE_EXPORT uint32_t UNITY_INTERFACE_API GetBindlessDescriptorStartIn
 
 UNITY_INTERFACE_EXPORT uint32_t UNITY_INTERFACE_API GetBindlessDescriptorCount();
 
+UNITY_INTERFACE_EXPORT uint64_t UNITY_INTERFACE_API GetCompletedFrameFenceValue();
+
+UNITY_INTERFACE_EXPORT uint64_t UNITY_INTERFACE_API GetPendingFrameFenceValue();
+
 UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateSRVDescriptor(ID3D12Resource *pTexture, uint32_t index);
 
 UNITY_INTERFACE_EXPORT bool UNITY_INTERFACE_API CreateUAVDescriptor(ID3D12Resource *pTexture, uint32_t index);
